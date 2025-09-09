@@ -1,0 +1,144 @@
+version: 2.1
+
+orbs:
+  docker: circleci/docker@2.4.0
+  heroku: circleci/heroku@2.0.0
+
+executors:
+  java-executor:
+    docker:
+      - image: cimg/openjdk:17.0
+      - image: cimg/postgres:15.1
+        environment:
+          POSTGRES_DB: travelplanner_test
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: password
+    working_directory: ~/travelplanner
+
+jobs:
+  setup:
+    executor: java-executor
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - v1-dependencies-{{ checksum "pom.xml" }}
+            - v1-dependencies-
+      - run:
+          name: Download dependencies
+          command: mvn dependency:go-offline
+      - save_cache:
+          paths:
+            - ~/.m2
+          key: v1-dependencies-{{ checksum "pom.xml" }}
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - travelplanner
+            - .m2
+
+  build:
+    executor: java-executor
+    steps:
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Compile application
+          command: mvn clean compile
+      - run:
+          name: Package application
+          command: mvn package -DskipTests
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - travelplanner/target
+
+  test:
+    executor: java-executor
+    steps:
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Wait for PostgreSQL
+          command: |
+            for i in `seq 1 10`;
+            do
+              nc -z localhost 5432 && echo Success && exit 0
+              echo -n .
+              sleep 1
+            done
+            echo Failed waiting for PostgreSQL && exit 1
+      - run:
+          name: Run unit tests
+          command: mvn test
+      - store_test_results:
+          path: target/surefire-reports
+      - store_artifacts:
+          path: target/surefire-reports
+          destination: test-results
+
+  docker-build-push:
+    executor: docker/docker
+    steps:
+      - setup_remote_docker:
+          version: 20.10.18
+      - checkout
+      - docker/check
+      - run:
+          name: Build Docker image
+          command: |
+            docker build -t $DOCKER_USERNAME/travelplanner:latest .
+            docker tag $DOCKER_USERNAME/travelplanner:latest $DOCKER_USERNAME/travelplanner:${CIRCLE_SHA1:0:7}
+      - run:
+          name: Push Docker image
+          command: |
+            echo $DOCKER_PASSWORD | docker login -u $DOCKER_USERNAME --password-stdin
+            docker push $DOCKER_USERNAME/travelplanner:latest
+            docker push $DOCKER_USERNAME/travelplanner:${CIRCLE_SHA1:0:7}
+
+  deploy-heroku:
+    executor: heroku/default
+    steps:
+      - checkout
+      - heroku/install
+      - run:
+          name: Deploy to Heroku
+          command: |
+            heroku container:login
+            heroku container:push web --app $HEROKU_APP_NAME
+            heroku container:release web --app $HEROKU_APP_NAME
+
+workflows:
+  version: 2
+
+  develop-ci:
+    jobs:
+      - setup:
+          filters:
+            branches:
+              only: develop
+      - build:
+          requires:
+            - setup
+      - test:
+          requires:
+            - build
+
+  release-ci-cd:
+    jobs:
+      - setup:
+          filters:
+            branches:
+              only: release
+      - build:
+          requires:
+            - setup
+      - test:
+          requires:
+            - build
+      - docker-build-push:
+          requires:
+            - test
+      - deploy-heroku:
+          requires:
+            - docker-build-push
